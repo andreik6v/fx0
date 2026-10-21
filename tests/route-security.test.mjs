@@ -14,6 +14,7 @@ const mocks = {
   'lib/trial.ts': `
     export const trialEnabled = () => !!globalThis.securityTest.trialEnabled;
     export const getGuestSession = async () => globalThis.securityTest.guest ?? null;
+    export async function clearGuestSession() { globalThis.securityTest.trace.push('clear-guest'); globalThis.securityTest.guest = null; }
     export async function createGuestSession() {
       const s = globalThis.securityTest;
       if (!s.trialEnabled) throw new Error('Trials disabled');
@@ -579,6 +580,18 @@ test('a capped attachment still schedules durable cleanup after its refusal; del
   assert.equal(deleting.afterTasks.length, 1)
   await deleting.afterTasks[0]()
   assert.equal(deleting.trace.includes('cleanup-retry'), true)
+})
+
+test('a guest who signs in has their chats claimed once, then the guest cookie is dropped', async () => {
+  const s = reset({ guest: { kind: 'guest', userId: `guest:${'b'.repeat(32)}`, loginId: 'b'.repeat(32), loginAt: 1000, expiresAt: Date.now() + 86_400_000 } })
+  const claims = () => s.queries.filter(({ text }) => text.startsWith('UPDATE fx0_chat_ownership SET user_id')).length
+  assert.equal((await routes.session.GET(request('session', 'GET'))).status, 200)
+  assert.equal(claims(), 1)
+  assert.deepEqual(s.queries.find(({ text }) => text.startsWith('UPDATE fx0_chat_ownership SET user_id')).values, ['user_a', `guest:${'b'.repeat(32)}`])
+  assert.ok(s.trace.includes('clear-guest'))
+  assert.equal(s.guest, null)
+  assert.equal((await routes.session.GET(request('session', 'GET'))).status, 200)
+  assert.equal(claims(), 1, 'a later request does not repeat the claim')
 })
 
 test('the artifact preview paints no white of its own before the design does', async () => {
