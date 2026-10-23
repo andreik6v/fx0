@@ -21,16 +21,17 @@ const PIXEL = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQ
 const SESSION = 'preview-browser-session'
 const TOKEN = 'preview-browser-ready'
 
-function design({ color = 'rgb(10, 20, 30)', title = 'Original title', padding = 4, image = '', photo = false, program = 'original', structure = '', beforeLoad = '' } = {}) {
+function design({ color = 'rgb(10, 20, 30)', title = 'Original title', padding = 4, image = '', photo = false, program = 'original', structure = '', beforeLoad = '', sheetId = true } = {}) {
   return `<!doctype html><html><head><title>Interactive presentation</title>
-<style id="theme">body{margin:0;min-height:2600px}#title{color:${color}}#swatch{width:80px;height:80px;background-image:${image ? `url(https://fixture.invalid/${image})` : 'none'}}</style>
+<style${sheetId ? ' id="theme"' : ''}>body{margin:0;min-height:2600px}#title{color:${color}}#swatch{width:80px;height:80px;background-image:${image ? `url(https://fixture.invalid/${image})` : 'none'}}</style>
 </head><body class="slide-1"><h1 id="title">${title}</h1>
 <p id="inline" style="padding:${padding}px">Inline target</p><p id="runtime-label">Authored label</p>
 <input id="input" value="authored"><button id="next">Next slide</button><div id="swatch"></div>
 ${photo ? '<img id="photo" alt="Local fixture" src="https://fixture.invalid/pixel.png">' : ''}${structure}
 <script>
 const instance = crypto.randomUUID(), program = ${JSON.stringify(program)}
-const refs = Object.fromEntries(['title', 'inline', 'input', 'next', 'theme'].map(id => [id, document.getElementById(id)]))
+const find = id => id === 'theme' ? document.querySelector('style') : document.getElementById(id)
+const refs = Object.fromEntries(['title', 'inline', 'input', 'next', 'theme'].map(id => [id, find(id)]))
 let clicks = 0
 refs.next.addEventListener('click', () => { clicks++; document.body.className = 'slide-' + (4 + clicks) })
 document.body.className = 'slide-4'
@@ -43,14 +44,14 @@ send({ kind: 'boot' })
 addEventListener('error', event => send({ kind: 'error', error: event.message }))
 addEventListener('unhandledrejection', event => send({ kind: 'error', error: String(event.reason) }))
 const report = () => {
-  const title = document.getElementById('title'), input = document.getElementById('input'), sheet = document.getElementById('theme').sheet
+  const title = document.getElementById('title'), input = document.getElementById('input'), sheet = find('theme').sheet
   send({ kind: 'state', title: title.textContent, color: getComputedStyle(title).color,
     padding: getComputedStyle(document.getElementById('inline')).paddingTop, background: getComputedStyle(document.getElementById('swatch')).backgroundImage,
     className: document.body.className, input: input.value, focused: document.activeElement === input,
     selection: [input.selectionStart, input.selectionEnd], scroll: Math.round(scrollY), clicks,
-    sameNodes: Object.entries(refs).every(([id, node]) => document.getElementById(id) === node),
+    sameNodes: Object.entries(refs).every(([id, node]) => find(id) === node),
     runtimeLabel: document.getElementById('runtime-label').textContent, generated: !!document.getElementById('generated'),
-    cssText: document.getElementById('theme').textContent, rules: sheet.cssRules.length, disabled: sheet.disabled,
+    cssText: find('theme').textContent, rules: sheet.cssRules.length, disabled: sheet.disabled,
     photo: document.getElementById('photo')?.getAttribute('src') ?? null,
     photoDecoded: !!document.getElementById('photo')?.naturalWidth, added: !!document.getElementById('added'),
     csp: document.querySelector('meta[http-equiv="Content-Security-Policy"]')?.content })
@@ -406,6 +407,86 @@ test('in Chrome, the production preview wrapper and React PreviewPane preserve s
       await update(paint, 6, payload(7, design({ photo: true, color: 'rgb(1, 2, 3)', title: 'After real reload', padding: 12, program: 'replacement', structure: '<aside id="added">New structure</aside>' })), 'reload')
       assert.equal((await state()).added, false)
       assert.equal((await observed()).boots.length, boots + 1)
+      await noErrors()
+    })
+
+    await t.test('CSS updates preserve cached stylesheet references and unchanged neighboring rules, including id-less styles', async () => {
+      for (const sheetId of [true, false]) {
+        const options = { sheetId, beforeLoad: 'window.cachedSheet = refs.theme.sheet; window.cachedFirstRule = cachedSheet.cssRules[0]' }
+        const current = await mounted(payload(200, design(options))), before = await state(), boots = (await observed()).boots.length
+        await update(current, 200, payload(201, design({ ...options, color: 'rgb(90, 80, 70)' })))
+        preserved(before, await waitState(s => s.color === 'rgb(90, 80, 70)'))
+        assert.equal(await evaluate('cachedSheet === refs.theme.sheet', 2), true, 'authored code keeps its CSSStyleSheet reference')
+        assert.equal(await evaluate('cachedFirstRule === cachedSheet.cssRules[0]', 2), true, 'an unchanged neighboring rule is not replaced')
+        await update(current, 201, payload(202, design({ ...options, color: 'rgb(21, 32, 43)' })))
+        preserved(before, await waitState(s => s.color === 'rgb(21, 32, 43)'))
+        assert.equal(await evaluate('cachedSheet === refs.theme.sheet', 2), true, 'a second update keeps the same stylesheet')
+        await evaluate('window.currentRules = [...cachedSheet.cssRules]', 2)
+        const formatted = design({ ...options, color: 'rgb(21, 32, 43)' }).replace('body{margin:0;', '/* formatting only */body{margin:0;')
+        await update(current, 202, payload(203, formatted))
+        assert.equal(await evaluate('currentRules.every((rule, index) => cachedSheet.cssRules[index] === rule)', 2), true, 'canonical no-ops do not replace rule objects')
+        await evaluate("cachedSheet.insertRule('#title { color: rgb(4, 5, 6) }', cachedSheet.cssRules.length)", 2)
+        preserved(before, await waitState(s => s.color === 'rgb(4, 5, 6)'))
+        const result = await update(current, 203, payload(204, design({ ...options, color: 'rgb(99, 88, 77)', title: 'Must not overwrite runtime CSS' })), 'reload')
+        assert.match(result.reason, /stylesheet.*conflict/)
+        assert.equal((await state()).title, before.title, 'a CSSOM conflict prevents unrelated text writes')
+        assert.equal((await observed()).boots.length, boots)
+      }
+      await noErrors()
+    })
+
+    await t.test('id-less stylesheet lookup distinguishes logical duplicates from stale physical text after an update', async () => {
+      for (const duplicate of ['logical', 'physical']) {
+        const options = { sheetId: false }, original = design(options), changed = design({ ...options, color: 'rgb(90, 80, 70)' })
+        const current = await mounted(payload(210, original)), before = await state()
+        await update(current, 210, payload(211, changed))
+        await waitState(s => s.color === 'rgb(90, 80, 70)')
+        const css = (duplicate === 'logical' ? changed : original).match(/<style>([\s\S]*?)<\/style>/)[1]
+        await evaluate(`{ const extra = document.createElement('style'); extra.textContent = ${JSON.stringify(css)}; document.head.append(extra) }`, 2)
+        const result = await update(current, 211, payload(212, design({ ...options, color: 'rgb(21, 32, 43)', title: 'Unambiguous update' })), duplicate === 'logical' ? 'reload' : 'applied')
+        if (duplicate === 'logical') {
+          assert.match(result.reason, /target/)
+          assert.equal((await state()).title, before.title)
+        } else {
+          preserved(before, await waitState(s => s.title === 'Unambiguous update'))
+          assert.equal(await evaluate("[...refs.theme.sheet.cssRules].some(rule => rule.cssText.includes('rgb(21, 32, 43)'))", 2), true)
+        }
+      }
+      await noErrors()
+    })
+
+    await t.test('CSS preflight rejects imports and invalid namespace splices before any stylesheet or text write', async () => {
+      const cases = [
+        { before: '#other { color: red }', after: '@import "data:text/css,body{}"; #other { color: red }' },
+        { before: '@namespace test "urn:old"; test|p { color: red }', after: '@namespace test "urn:new"; test|p { color: red }' },
+      ]
+      for (const { before: first, after: next } of cases) {
+        const original = design({ structure: `<style id="secondary">${first}</style>` })
+        const current = await mounted(payload(220, original)), before = await state()
+        const candidate = design({ color: 'rgb(99, 88, 77)', title: 'Must not write', structure: `<style id="secondary">${next}</style>` })
+        await update(current, 220, payload(221, candidate), 'reload')
+        const after = await state()
+        assert.equal(after.title, before.title)
+        assert.equal(after.color, before.color)
+        assert.equal(after.cssText, before.cssText)
+        preserved(before, after)
+      }
+      await noErrors()
+    })
+
+    await t.test('runtime stylesheet changes before load and after a hot update remain conflicts', async () => {
+      for (const mutation of ["refs.theme.sheet.insertRule('body { outline: 3px solid red }', refs.theme.sheet.cssRules.length)", "refs.theme.textContent += '\\n'"]) {
+        const options = { beforeLoad: mutation }, current = await mounted(payload(230, design(options))), before = await state()
+        await update(current, 230, payload(231, design({ ...options, color: 'rgb(99, 88, 77)', title: 'Must not write' })), 'reload')
+        assert.equal((await state()).title, before.title)
+        assert.equal((await state()).cssText, before.cssText)
+      }
+      const current = await mounted(payload(240, design()))
+      await update(current, 240, payload(241, design({ color: 'rgb(90, 80, 70)' })))
+      const before = await waitState(s => s.color === 'rgb(90, 80, 70)')
+      await evaluate("refs.theme.textContent += '\\n'", 2)
+      await update(current, 241, payload(242, design({ color: 'rgb(99, 88, 77)', title: 'Must not write' })), 'reload')
+      assert.equal((await state()).title, before.title)
       await noErrors()
     })
 

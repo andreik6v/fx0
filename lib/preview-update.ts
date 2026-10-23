@@ -35,7 +35,7 @@ export function previewUpdateRuntime(seed: PreviewSeed): void {
   type Change = { kind: 'css' | 'style' | 'text'; before: Element; after: Element }
   let baseline: Snapshot | undefined
   let bindings = new Map<Element, Element>()
-  const sheets = new Map<Element, CSSStyleSheet | null>()
+  const sheets = new Map<Element, { sheet: CSSStyleSheet | null; domText: string | null; renderText: string | null }>()
   let revision = seed.revision
   let initialized = false
   let failed = false
@@ -158,6 +158,12 @@ export function previewUpdateRuntime(seed: PreviewSeed): void {
     }
     return ids
   }
+  function styleText(element: HTMLStyleElement): string | null {
+    const tracked = sheets.get(element)
+    // CSSOM edits leave the physical text alone. Project only our own unchanged
+    // bindings; an authored DOM edit or a newly inserted style still speaks for itself.
+    return tracked && element.sheet === tracked.sheet && element.textContent === tracked.domText ? tracked.renderText : element.textContent
+  }
   function locate(element: Element, state: Snapshot, ids: Map<string, Element | null>): Element | null {
     const authored = state.authored.get(element)!
     if (authored.id) {
@@ -169,23 +175,31 @@ export function previewUpdateRuntime(seed: PreviewSeed): void {
     const expected = [...state.authored.keys()].filter(candidate => isStyle(candidate) &&
       candidate.textContent === element.textContent && sameAttributes(candidate, element))
     const matches = [...document.querySelectorAll('style')].filter(candidate => isStyle(candidate) &&
-      candidate.textContent === element.textContent && sameAttributes(candidate, element))
+      styleText(candidate) === element.textContent && sameAttributes(candidate, element))
     return expected.length === 1 && matches.length === 1 ? matches[0] : null
   }
   function rules(sheet: CSSStyleSheet): string {
     return JSON.stringify([...sheet.cssRules].map(rule => rule.cssText))
   }
-  function checkSheet(live: HTMLStyleElement, expected: Element, identity: boolean): CSSStyleSheet {
-    const sheet = live.sheet
-    if (!sheet || (identity && sheets.get(live) !== sheet)) reject('stylesheet-replaced')
-    if (live.textContent !== expected.textContent) reject('stylesheet-text-conflict')
+  function parseSheet(expected: Element): CSSStyleSheet {
+    // An inactive document parses ordinary sheet rules without touching the live tree.
+    // Unlike constructed replaceSync(), it does not silently discard @import rules.
+    const scratch = document.implementation.createHTMLDocument('')
+    const style = scratch.createElement('style')
+    style.media = expected.getAttribute('media') ?? ''
+    style.textContent = expected.textContent
+    scratch.head.append(style)
+    const sheet = style.sheet
+    if (!sheet || [...sheet.cssRules].some(rule => rule.type === CSSRule.IMPORT_RULE)) reject('unsupported-stylesheet-rules')
+    return sheet
+  }
+  function checkSheet(live: HTMLStyleElement, expected: Element, canonical: CSSStyleSheet): CSSStyleSheet {
+    const sheet = live.sheet, tracked = sheets.get(live)
+    if (!sheet || tracked?.sheet !== sheet) reject('stylesheet-replaced')
+    if (live.textContent !== tracked.domText || tracked.renderText !== expected.textContent) reject('stylesheet-text-conflict')
     for (const name of ['media', 'type', 'title']) {
       if (live.getAttribute(name) !== expected.getAttribute(name)) reject('stylesheet-state-conflict')
     }
-    // Constructed sheets normalize through the same browser CSS parser without touching
-    // the live tree. Unsupported rules (for example @import) conservatively conflict.
-    const canonical = new CSSStyleSheet({ media: expected.getAttribute('media') ?? '' })
-    canonical.replaceSync(expected.textContent ?? '')
     if (sheet.ownerNode !== live || sheet.disabled || sheet.href !== null || sheet.ownerRule !== null ||
       sheet.parentStyleSheet !== null || sheet.media.mediaText !== canonical.media.mediaText || rules(sheet) !== rules(canonical)) reject('stylesheet-cssom-conflict')
     return sheet
@@ -198,10 +212,24 @@ export function previewUpdateRuntime(seed: PreviewSeed): void {
       if (!live || !live.isConnected || bindings.get(before) !== live) reject('target-missing-or-replaced')
       if (kind === 'css') {
         if (!isStyle(live)) reject('stylesheet-target-mismatch')
-        checkSheet(live, before, true)
+        const scratch = parseSheet(before), next = parseSheet(after), sheet = checkSheet(live, before, scratch)
+        const previousRules = [...scratch.cssRules].map(rule => rule.cssText), nextRules = [...next.cssRules].map(rule => rule.cssText)
+        let start = 0, previousEnd = previousRules.length, nextEnd = nextRules.length
+        while (start < previousEnd && start < nextEnd && previousRules[start] === nextRules[start]) start++
+        while (previousEnd > start && nextEnd > start && previousRules[previousEnd - 1] === nextRules[nextEnd - 1]) { previousEnd--; nextEnd-- }
+        const splice = (target: CSSStyleSheet) => {
+          for (let index = previousEnd - 1; index >= start; index--) target.deleteRule(index)
+          for (let index = start; index < nextEnd; index++) target.insertRule(nextRules[index], index)
+        }
+        // Dry-run this exact splice before any operation writes to the live document.
+        // Valid CSS can still violate insertRule's ordering/namespace constraints.
+        splice(scratch)
+        if (rules(scratch) !== rules(next)) reject('unsupported-stylesheet-change')
         return () => {
-          live.textContent = after.textContent
-          sheets.set(live, checkSheet(live, after, false))
+          // Retain the sheet and unchanged neighboring rules that authored code may cache.
+          splice(sheet)
+          sheets.get(live)!.renderText = after.textContent
+          checkSheet(live, after, next)
         }
       }
       if (!standard(live) || editable(live) || (live as HTMLElement).isContentEditable || document.designMode === 'on') reject('editable-or-custom-target')
@@ -237,7 +265,7 @@ export function previewUpdateRuntime(seed: PreviewSeed): void {
         const live = locate(element, baseline, ids)
         if (live) {
           bindings.set(element, live)
-          if (isStyle(live)) sheets.set(live, live.sheet)
+          if (isStyle(live)) sheets.set(live, { sheet: live.sheet, domText: element.textContent, renderText: element.textContent })
         }
       }
       initialized = true
