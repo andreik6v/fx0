@@ -128,8 +128,14 @@ frame.addEventListener('load',()=>setTimeout(()=>{
   if(readySignals>consumedSignals){consumedSignals=readySignals;return;}
   restore();
 },100));
+// Hidden time and suspended timers are browser pauses, not design failures.
+let lastCheck=Date.now();
+document.addEventListener('visibilitychange',()=>{lastHeartbeat=lastCheck=Date.now();});
 setInterval(()=>{
-  if(document.visibilityState==='visible'&&Date.now()-lastHeartbeat>3000)restore();
+  const now=Date.now(),paused=now-lastCheck>3000;
+  lastCheck=now;
+  if(document.visibilityState!=='visible'||paused){lastHeartbeat=now;return;}
+  if(now-lastHeartbeat>3000)restore();
 },500);
 const read=blob=>new Promise(done=>{const reader=new FileReader();reader.onload=()=>done(String(reader.result));reader.onerror=()=>done(null);reader.readAsDataURL(blob)});
 const load=async src=>{try{const response=await fetch(src,{credentials:'same-origin'});if(!response.ok)return null;const blob=await response.blob();return /^image\\/(png|jpeg|gif|webp|avif)$/.test(blob.type)?await read(blob):null}catch{return null}};
