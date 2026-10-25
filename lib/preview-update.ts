@@ -214,19 +214,43 @@ export function previewUpdateRuntime(seed: PreviewSeed): void {
         if (!isStyle(live)) reject('stylesheet-target-mismatch')
         const scratch = parseSheet(before), next = parseSheet(after), sheet = checkSheet(live, before, scratch)
         const previousRules = [...scratch.cssRules].map(rule => rule.cssText), nextRules = [...next.cssRules].map(rule => rule.cssText)
-        let start = 0, previousEnd = previousRules.length, nextEnd = nextRules.length
-        while (start < previousEnd && start < nextEnd && previousRules[start] === nextRules[start]) start++
-        while (previousEnd > start && nextEnd > start && previousRules[previousEnd - 1] === nextRules[nextEnd - 1]) { previousEnd--; nextEnd-- }
-        const splice = (target: CSSStyleSheet) => {
-          for (let index = previousEnd - 1; index >= start; index--) target.deleteRule(index)
-          for (let index = start; index < nextEnd; index++) target.insertRule(nextRules[index], index)
+        const splices: { start: number; deleteCount: number; rules: string[] }[] = []
+        // Canonical no-ops retain every rule, even when identical rules are repeated.
+        if (previousRules.length !== nextRules.length || previousRules.some((text, index) => text !== nextRules[index])) {
+          const positions = new Map<string, number | null>()
+          previousRules.forEach((text, index) => positions.set(text, positions.has(text) ? null : index))
+          let previousStart = 0, nextStart = 0
+          // The trailing boundary closes the last gap without replacing any shared anchor.
+          for (let index = 0; index <= nextRules.length; index++) {
+            const previousIndex = index === nextRules.length ? previousRules.length : positions.get(nextRules[index])
+            if (previousIndex === undefined) continue
+            if (previousIndex === null || previousIndex < previousStart) reject('ambiguous-or-reordered-stylesheet-rules')
+            if (previousIndex > previousStart || index > nextStart) {
+              for (let removed = previousStart; removed < previousIndex; removed++) {
+                const rule = scratch.cssRules[removed] as CSSRule & { cssRules?: CSSRuleList }
+                // Replacing a parent would detach cached, possibly unchanged descendants.
+                if (rule.cssRules?.length) reject('unsupported-stylesheet-change')
+              }
+              splices.push({ start: previousStart, deleteCount: previousIndex - previousStart, rules: nextRules.slice(nextStart, index) })
+            }
+            previousStart = previousIndex + 1
+            nextStart = index + 1
+          }
         }
-        // Dry-run this exact splice before any operation writes to the live document.
+        const splice = (target: CSSStyleSheet) => {
+          // Right-to-left edits leave every earlier splice's original indices valid.
+          for (let index = splices.length - 1; index >= 0; index--) {
+            const edit = splices[index]
+            for (let offset = edit.deleteCount - 1; offset >= 0; offset--) target.deleteRule(edit.start + offset)
+            for (let offset = 0; offset < edit.rules.length; offset++) target.insertRule(edit.rules[offset], edit.start + offset)
+          }
+        }
+        // Dry-run the complete plan before any operation writes to the live document.
         // Valid CSS can still violate insertRule's ordering/namespace constraints.
         splice(scratch)
         if (rules(scratch) !== rules(next)) reject('unsupported-stylesheet-change')
         return () => {
-          // Retain the sheet and unchanged neighboring rules that authored code may cache.
+          // Retain the sheet and all shared unchanged rules that authored code may cache.
           splice(sheet)
           sheets.get(live)!.renderText = after.textContent
           checkSheet(live, after, next)

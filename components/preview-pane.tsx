@@ -117,6 +117,7 @@ export default function PreviewPane({
     let attempt: PreviewAttempt | null = null
     let loading: number | null = slots[0] ? 0 : null
     let loadTimer: ReturnType<typeof setTimeout> | null = null
+    let loadClock: { remaining: number; checkedAt: number; visible: boolean } | null = null
     const active = () => !disposed && currentScope.current === scope
     const urlFor = (revision: number) => `/api/artifact-frame?session=${session}&${viewing == null ? 'v' : 'revision'}=${revision}`
     const publish = () => {
@@ -137,6 +138,7 @@ export default function PreviewPane({
     const clearLoading = () => {
       if (loadTimer) clearTimeout(loadTimer)
       loadTimer = null
+      loadClock = null
       if (loading != null) {
         slots[loading] = null
         if (front === loading) front = null
@@ -148,11 +150,31 @@ export default function PreviewPane({
       publish()
     }
     const watchLoad = (index: number) => {
-      loadTimer = setTimeout(() => {
-        if (!active() || loading !== index) return
-        clearLoading()
-        fail('The design preview did not finish loading. Try again.')
-      }, PREVIEW_PREPARE_MS * 2)
+      const clock = { remaining: PREVIEW_PREPARE_MS * 2, checkedAt: Date.now(), visible: document.visibilityState === 'visible' }
+      loadClock = clock
+      const check = () => {
+        if (!active() || loading !== index || loadClock !== clock) return
+        const now = Date.now(), elapsed = now - clock.checkedAt, visible = document.visibilityState === 'visible'
+        // Painting waits on animation frames. Hidden or suspended time cannot prove
+        // that a loaded document failed; acquisition/preparation keep their own bounds.
+        if (clock.visible && visible && elapsed <= 3000) clock.remaining -= Math.max(0, elapsed)
+        clock.checkedAt = now
+        clock.visible = visible
+        if (visible && elapsed > 3000) frames.current[index]?.contentWindow?.postMessage({ type: 'fx0-preview-status', protocol: PREVIEW_PROTOCOL }, window.location.origin)
+        if (clock.remaining <= 0) {
+          clearLoading()
+          fail('The design preview did not finish loading. Try again.')
+          return
+        }
+        loadTimer = setTimeout(check, 500)
+      }
+      loadTimer = setTimeout(check, 500)
+    }
+    const onVisibilityChange = () => {
+      if (!active() || !loadClock) return
+      loadClock.checkedAt = Date.now()
+      loadClock.visible = document.visibilityState === 'visible'
+      if (loadClock.visible && loading != null) frames.current[loading]?.contentWindow?.postMessage({ type: 'fx0-preview-status', protocol: PREVIEW_PROTOCOL }, window.location.origin)
     }
     if (loading != null) watchLoad(loading)
     const loadFull = (revision: number) => {
@@ -342,6 +364,7 @@ export default function PreviewPane({
       if (loading === index) {
         if (loadTimer) clearTimeout(loadTimer)
         loadTimer = null
+        loadClock = null
         loading = null
         // Old documents are deliberately not cached after cross-document navigation.
         slots[1 - index] = null
@@ -353,6 +376,7 @@ export default function PreviewPane({
       void pump()
     }
     window.addEventListener('message', onMessage)
+    document.addEventListener('visibilitychange', onVisibilityChange)
     // The SSR iframe can paint before hydration installs this listener.
     for (const frame of frames.current) frame?.contentWindow?.postMessage({ type: 'fx0-preview-status', protocol: PREVIEW_PROTOCOL }, window.location.origin)
     return () => {
@@ -361,6 +385,7 @@ export default function PreviewPane({
       clearAttempt()
       clearLoading()
       window.removeEventListener('message', onMessage)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
       demand.current = () => {}
       retry.current = () => {}
     }

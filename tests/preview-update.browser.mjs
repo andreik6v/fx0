@@ -256,7 +256,7 @@ test('in Chrome, the production preview wrapper and React PreviewPane preserve s
   // not expensive pixel allocation. Three occurrences stay below the real budget.
   const largeImage = Buffer.alloc(Math.floor(1.1 * 1024 * 1024), 0x41)
   PIXEL.copy(largeImage)
-  const paneArtifacts = new Map(), paneLatest = new Map(), paneModes = new Map(), paneRequests = [], paneHeld = [], bundleHeld = []
+  const paneArtifacts = new Map(), paneLatest = new Map(), paneModes = new Map(), paneRequests = [], paneHeld = [], paneHtmlHeld = [], bundleHeld = []
   let paneFixture, holdBundle = true
   let origin, chrome, cdp, chromeError = '', frameNumber = 0, requestNumber = 0, offRouteHits = 0
   const sendFrame = (response, preview) => {
@@ -277,8 +277,11 @@ test('in Chrome, the production preview wrapper and React PreviewPane preserve s
       const preview = paneArtifacts.get(`${session}:${revision}`), json = url.searchParams.get('format') === 'json'
       paneRequests.push({ session, wanted, revision, json })
       if (!preview) return response.writeHead(404, { 'content-type': 'application/json' }).end('{"error":"No local design"}')
-      if (!json) return sendFrame(response, preview)
       const mode = paneModes.get(`${session}:${wanted}`)
+      if (!json) {
+        if (mode === 'hold-html') return void paneHtmlHeld.push({ response, preview })
+        return sendFrame(response, preview)
+      }
       if (mode === 'error') return response.writeHead(503, { 'content-type': 'application/json' }).end('{"error":"Local failure"}')
       // Only the external snapshot/data source is simulated. JSON never mounts or
       // executes a candidate; the real React effect decides what to do with it.
@@ -432,6 +435,67 @@ test('in Chrome, the production preview wrapper and React PreviewPane preserve s
         assert.equal((await state()).title, before.title, 'a CSSOM conflict prevents unrelated text writes')
         assert.equal((await observed()).boots.length, boots)
       }
+      await noErrors()
+    })
+
+    await t.test('disjoint CSS edits, insertions and deletions retain the untouched rule and its live declaration', async () => {
+      for (const sheetId of [true, false]) {
+        const options = { sheetId, beforeLoad: 'window.cachedSheet = refs.theme.sheet; window.cachedRule = [...cachedSheet.cssRules].find(rule => rule.selectorText === "#title"); refs.next.addEventListener("click", () => { cachedRule.style.opacity = "0.4" })' }
+        const original = design(options)
+        const changed = value => original.replace('min-height:2600px}', `min-height:2600px;background:rgb(${value},2,3)}`).replace('width:80px;', `width:${80 + value}px;`)
+        const current = await mounted(payload(250, original)), before = await state(), boots = (await observed()).boots.length
+        await update(current, 250, payload(251, changed(1)))
+        assert.equal(await evaluate('[...cachedSheet.cssRules].includes(cachedRule)', 2), true, 'an untouched rule between two edited rules keeps its identity')
+        await update(current, 251, payload(252, changed(2)))
+        const inserted = changed(2).replace('#title{', '.unused-before{color:red}#title{').replace('#swatch{', '.unused-after{color:blue}#swatch{')
+        await update(current, 252, payload(253, inserted))
+        await update(current, 253, payload(254, changed(2)))
+        assert.equal(await evaluate('cachedSheet === refs.theme.sheet && [...cachedSheet.cssRules].includes(cachedRule)', 2), true, 'separate insertions and deletions retain the cached sheet and rule')
+        preserved(before, await state())
+        await evaluate("document.getElementById('next').click()", 2)
+        await waitState(s => s.clicks === 1)
+        assert.equal(await evaluate('getComputedStyle(refs.title).opacity', 2), '0.4', 'the original handler still changes displayed CSS through its cached declaration')
+        assert.equal((await observed()).boots.length, boots)
+      }
+      await noErrors()
+    })
+
+    await t.test('reordered or ambiguous shared rules reload before unrelated CSS, inline style or text is written', async () => {
+      const original = design(), css = original.match(/<style[^>]*>([\s\S]*?)<\/style>/)[1], rules = css.match(/[^}]+}/g)
+      for (const [previous, next] of [
+        [rules, [rules[1], rules[0], rules[2]]],
+        [[rules[0], rules[1], rules[1], rules[2]], [rules[0].replace('margin:0', 'margin:1px'), rules[1], rules[1], rules[2].replace('width:80px', 'width:81px')]],
+      ]) {
+        const current = await mounted(payload(260, original.replace(css, previous.join('')))), before = await state()
+        const candidate = original.replace(css, next.join('')).replace('>Original title</h1>', '>Must not write</h1>').replace('padding:4px', 'padding:12px')
+        await update(current, 260, payload(261, candidate), 'reload')
+        const after = await state()
+        assert.equal(after.cssText, before.cssText)
+        assert.equal(after.title, before.title)
+        assert.equal(after.padding, before.padding)
+        preserved(before, after)
+      }
+      await noErrors()
+    })
+
+    await t.test('changed grouping rules reload without detaching cached unchanged descendants', async () => {
+      const options = { beforeLoad: 'window.cachedGroup = refs.theme.sheet.cssRules[0]; window.cachedRule = cachedGroup.cssRules[1]; refs.next.addEventListener("click", () => { cachedRule.style.opacity = "0.4" })' }
+      const original = design(options).replace(/(<style[^>]*>)([\s\S]*?)(<\/style>)/, '$1@media (min-width:0px){$2}$3')
+      const current = await mounted(payload(270, original)), before = await state(), boots = (await observed()).boots.length
+      const formatted = original.replace('body{margin:0;', '/* formatting only */body{margin:0;')
+      await update(current, 270, payload(271, formatted))
+      assert.equal(await evaluate('cachedGroup === refs.theme.sheet.cssRules[0] && cachedRule === cachedGroup.cssRules[1]', 2), true, 'grouped canonical no-ops keep the entire rule tree')
+      const candidate = formatted.replace('min-height:2600px}', 'min-height:2600px;background:red}').replace('width:80px;', 'width:81px;').replace('>Original title</h1>', '>Must not write</h1>').replace('padding:4px', 'padding:12px')
+      await update(current, 271, payload(272, candidate), 'reload')
+      const after = await state()
+      assert.equal(after.cssText, before.cssText)
+      assert.equal(after.title, before.title)
+      assert.equal(after.padding, before.padding)
+      preserved(before, after)
+      await evaluate("document.getElementById('next').click()", 2)
+      await waitState(s => s.clicks === 1)
+      assert.equal(await evaluate('getComputedStyle(refs.title).opacity', 2), '0.4', 'a rejected group replacement leaves the original cached declaration live')
+      assert.equal((await observed()).boots.length, boots)
       await noErrors()
     })
 
@@ -873,6 +937,67 @@ test('in Chrome, the production preview wrapper and React PreviewPane preserve s
         for (const { response } of paneHeld) response.destroy()
       }
     })
+
+    await t.test('a loaded replacement survives background time while a genuinely visible load still has a deadline', async () => {
+      paneFixture ??= await buildPaneFixture(dir)
+      holdBundle = false
+      const publish = (revision, program) => {
+        paneArtifacts.set(`${SESSION}:${revision}`, payload(revision, design({ program })))
+        paneLatest.set(SESSION, revision)
+      }
+      const painted = revision => until(async () => (await observed()).paints.find(p => p.revision === revision && p.updateReady), `background-safe paint ${revision}`)
+      const status = () => evaluate("document.querySelector('#preview-pane [role=status]')?.textContent ?? ''")
+      const frameCount = () => evaluate("document.querySelectorAll('#preview-pane iframe').length")
+      let alternate
+      try {
+        publish(101, 'background initial')
+        await cdp.call('Page.navigate', { url: `${origin}/pane` })
+        await until(() => evaluate('window.fixtureReady === true'), 'background fixture hydration')
+        await painted(101)
+        publish(301, 'background replacement')
+        paneModes.set(`${SESSION}:301`, 'hold-html')
+        const heldCount = paneHtmlHeld.length
+        await evaluate('setRevision(301)')
+        await until(() => paneHtmlHeld.length === heldCount + 1, 'replacement HTML held before the tab becomes hidden')
+        await cdp.call('Emulation.setFocusEmulationEnabled', { enabled: false })
+        const other = await cdp.call('Target.createTarget', { url: 'about:blank' })
+        alternate = other.targetId
+        await cdp.call('Target.activateTarget', { targetId: alternate })
+        await until(() => evaluate('document.visibilityState === "hidden"'), 'the real parent tab is hidden')
+        const pending = paneHtmlHeld[heldCount]
+        sendFrame(pending.response, pending.preview)
+        await until(async () => (await observed()).boots.some(boot => boot.program === 'background replacement'), 'the replacement program boots while hidden')
+        // Hidden tabs pause the two animation frames used to confirm the first paint.
+        // Exceed the old twenty-second wall-clock deadline without mocking this state.
+        await sleep(21_000)
+        assert.equal(await status(), '', 'hidden time is not a failed paint')
+        assert.equal(await frameCount(), 2, 'the loaded replacement stays mounted until it can paint')
+        await cdp.call('Page.bringToFront')
+        await until(() => evaluate('document.visibilityState === "visible"'), 'parent tab resumes')
+        await painted(301)
+        await until(async () => await frameCount() === 1, 'replacement is revealed and the old front is removed')
+        assert.equal(await status(), '')
+        assert.equal((await observed()).boots.filter(boot => boot.program === 'background replacement').length, 1, 'resuming neither reloads nor restarts the replacement')
+
+        publish(302, 'never-loaded replacement')
+        paneModes.set(`${SESSION}:302`, 'hold-html')
+        const stalledCount = paneHtmlHeld.length
+        await evaluate('setRevision(302)')
+        await until(() => paneHtmlHeld.length === stalledCount + 1, 'a genuinely stalled visible HTML load')
+        // Advance native Chrome timers instead of adding a second wall-clock wait.
+        await cdp.call('Emulation.setVirtualTimePolicy', { policy: 'advance', budget: 21_000 })
+        await until(async () => (await status()).includes('did not finish loading'), 'the visible paint deadline still expires')
+        assert.equal(await frameCount(), 1, 'a genuine visible failure retains the confirmed document')
+        await noErrors()
+      } finally {
+        await cdp.call('Page.bringToFront')
+        await cdp.call('Emulation.setFocusEmulationEnabled', { enabled: true })
+        if (alternate) await cdp.call('Target.closeTarget', { targetId: alternate })
+        paneModes.delete(`${SESSION}:301`)
+        paneModes.delete(`${SESSION}:302`)
+        for (const { response } of paneHtmlHeld) response.destroy()
+      }
+    })
     await noErrors()
   } catch (error) {
     t.diagnostic(`Browser failure: ${error.stack}; runtime errors: ${JSON.stringify(errors)}`)
@@ -892,7 +1017,7 @@ test('in Chrome, the production preview wrapper and React PreviewPane preserve s
       if (chrome.exitCode === null && chrome.signalCode === null) { chrome.kill('SIGKILL'); await exited }
     }
     chrome?.stderr.destroy()
-    for (const { response } of [...held, ...paneHeld]) response.destroy()
+    for (const { response } of [...held, ...paneHeld, ...paneHtmlHeld]) response.destroy()
     for (const response of bundleHeld) response.destroy()
     server.closeAllConnections()
     await new Promise(resolve => server.close(resolve))
